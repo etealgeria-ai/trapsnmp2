@@ -189,6 +189,7 @@ class Service:
             node = f"ns={index};s=Remote{slot}" if index else f"Remote{slot}"
             slots.append({"tag": f"Remote{slot}", "node": node, **slot_fields(row)})
         snap["slots"] = slots
+        snap["capacity"] = REMOTE_TAG_COUNT
         # The console reads the slots. Sending the raw rows too doubled the
         # size of every /api/state response.
         snap.pop("remotes", None)
@@ -203,6 +204,7 @@ class Service:
             "amplitude": _SINE_AMPLITUDE,
             "period": int(_SINE_PERIOD),
             "spread": _SINE_SPREAD,
+            "remotes": REMOTE_TAG_COUNT,
         }
 
     def set_sine(self, enabled: bool) -> dict:

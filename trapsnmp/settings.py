@@ -9,6 +9,7 @@ import os
 
 from trapsnmp.agent import COMPARISONS
 from trapsnmp.paths import DATA_DIR
+from trapsnmp.radios import MAX_REMOTES
 
 log = logging.getLogger("trapsnmp.settings")
 
@@ -312,6 +313,8 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
                 row[key] = raw
         if row:
             remotes.append(row)
+    # Older files may hold more remotes than there are Remote tags now.
+    remotes = remotes[:MAX_REMOTES]
     if remotes:
         service.radios.remotes = remotes
         for index, row in enumerate(remotes, start=1):

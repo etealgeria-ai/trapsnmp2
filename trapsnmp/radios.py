@@ -28,8 +28,8 @@ log = logging.getLogger("trapsnmp.radios")
 
 ENTRY = "1.3.6.1.4.1.4130.10.2.5.1.2.2.1"
 _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")
-# One OPC UA folder per remote, Remote1 through Remote999.
-MAX_REMOTES = 999
+# One OPC UA folder per remote, Remote1 through Remote255.
+MAX_REMOTES = 255
 
 # Names and numbers are from MDS-IF-LN-MIB (May 16, 2018).
 LINK_STATUS = {

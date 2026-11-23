@@ -1,4 +1,4 @@
-const state = { selected: null, sending: false, view: "monitor", opcFolder: "Latest", opcRadios: false };
+const state = { selected: null, sending: false, view: "monitor", opcFolder: "Latest", opcRadios: false, remoteCount: 255 };
 
 function esc(value) {
   return String(value ?? "")
@@ -169,12 +169,13 @@ function render(data) {
   renderRadios(data.radios);
   if (state.view === "opc") refreshOpc();
   const sine = data.sine || {};
+  state.remoteCount = data.radios?.capacity || state.remoteCount;
   const sineToggle = document.getElementById("sine-toggle");
   const sineNote = document.getElementById("sine-note");
   if (sineToggle) sineToggle.textContent = sine.enabled ? "Stop RSSI sine" : "Start RSSI sine";
   if (sineNote) {
     sineNote.textContent = sine.enabled && sine.rssi !== null && sine.rssi !== undefined
-      ? `Running. Shared RSSI ${sine.rssi} dBm. Remote1–Remote999 add a random ±${sine.spread} dBm.`
+      ? `Running. Shared RSSI ${sine.rssi} dBm. Remote1–Remote${state.remoteCount} add a random ±${sine.spread} dBm.`
       : sine.enabled
         ? "Running."
         : "Stopped.";
@@ -645,14 +646,14 @@ const RADIO_COLUMNS = [
 function opcTree() {
   const host = document.getElementById("opc-tree");
   if (!host) return;
-  const sig = `${state.opcFolder}|${state.opcRadios}`;
+  const sig = `${state.opcFolder}|${state.opcRadios}|${state.remoteCount}`;
   if (host.dataset.sig === sig) return;
   host.dataset.sig = sig;
   const current = state.opcFolder;
   const button = (id, label, cls) =>
     `<button type="button" class="${cls}${id === current ? " selected" : ""}" data-opc="${esc(id)}">${esc(label)}</button>`;
   const remotes = state.opcRadios
-    ? Array.from({ length: 999 }, (_, index) => button(`Remote${index + 1}`, `Remote${index + 1}`, "remote")).join("")
+    ? Array.from({ length: state.remoteCount }, (_, index) => button(`Remote${index + 1}`, `Remote${index + 1}`, "remote")).join("")
     : "";
   host.innerHTML = [
     button("trapsnmp", "trapsnmp", ""),

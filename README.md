@@ -30,9 +30,9 @@ The built-in SNMP agent answers Get, GetNext, GetBulk, and Set on UDP 1161, and 
 
 ## GE Orbit radios
 
-The Radios page polls a GE Orbit LN master (`mIfLnStatusConnRemTable`) and writes each connected radio into `Remote1` through `Remote999`. Every remote has the short tags (`remote_mac`, `remote_ip`, `rssi`, `down`, `if_index`) plus one tag per column of `mIfLnStatusConnRemEntry` in MDS-IF-LN-MIB. The master IP, community, port, and poll interval are set on the Config page.
+The Radios page polls a GE Orbit LN master (`mIfLnStatusConnRemTable`) and writes each connected radio into `Remote1` through `Remote255`. Radios past the 255th are not published. Every remote has the short tags (`remote_mac`, `remote_ip`, `rssi`, `down`, `if_index`) plus one tag per column of `mIfLnStatusConnRemEntry` in MDS-IF-LN-MIB. The master IP, community, port, and poll interval are set on the Config page.
 
-The Send page can simulate those columns for Remote1 through Remote999 on one RSSI sine wave, with a random offset per remote.
+The Send page can simulate those columns for Remote1 through Remote255 on one RSSI sine wave, with a random offset per remote.
 
 ## OPC UA security
 
@@ -50,7 +50,7 @@ The data folder is `TRAPSNMP_DATA` if that variable is set, otherwise `/workspac
 
 - Settings and certificates no longer require `/workspace/data`; the gateway used to crash at start on machines without it. See the data folder note above.
 - The GE Orbit poller reuses one SNMP engine. A new engine per poll left a UDP socket and a timer task running every time.
-- The poller keeps up to 999 remotes, matching `Remote1`–`Remote999` (it stopped at 256).
+- Remote tags reduced to `Remote1`–`Remote255`, and the poller keeps exactly that many (it stopped at 256 while tags went to `Remote999`). Remote values saved by an older version beyond 255 are dropped on load.
 - Remote values are saved once a minute instead of every 2 seconds, and the settings file is written atomically.
 - The radio poller and the RSSI sine keep running after a failed step instead of stopping silently.
 - Upstream OPC UA forwarding uses one connection at a time, times out after 2 s, and pauses 10 s after a failure, so a dead upstream no longer stalls every trap.
@@ -61,4 +61,4 @@ The data folder is `TRAPSNMP_DATA` if that variable is set, otherwise `/workspac
 - `Recent` has its own folder in the OPC UA browser instead of showing under Tags.
 - The console makes one `/api/state` request at a time, and the response no longer carries every remote twice.
 
-Not changed yet: the console still has no login and listens on all interfaces, and the RSSI sine still sends 999 loopback traps every 2 s.
+Not changed yet: the console still has no login and listens on all interfaces, and the RSSI sine still sends 255 loopback traps every 2 s.
