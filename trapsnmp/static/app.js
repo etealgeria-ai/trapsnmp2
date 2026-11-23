@@ -175,7 +175,7 @@ function render(data) {
   if (sineToggle) sineToggle.textContent = sine.enabled ? "Stop RSSI sine" : "Start RSSI sine";
   if (sineNote) {
     sineNote.textContent = sine.enabled && sine.rssi !== null && sine.rssi !== undefined
-      ? `Running. Shared RSSI ${sine.rssi} dBm. Remote1–Remote${state.remoteCount} add a random ±${sine.spread} dBm.`
+      ? `Running every ${sine.every || 10} s. Shared RSSI ${sine.rssi} dBm. Remote1–Remote${state.remoteCount} add a random ±${sine.spread} dBm.`
       : sine.enabled
         ? "Running."
         : "Stopped.";

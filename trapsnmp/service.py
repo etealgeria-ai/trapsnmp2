@@ -50,7 +50,7 @@ _MAX_VALUE = 512
 _SINE_CENTER = -75
 _SINE_AMPLITUDE = 15
 _SINE_PERIOD = 30.0
-_SINE_EVERY = 2.0
+_SINE_EVERY = 10.0  # seconds between sine steps (one trap per remote)
 _SINE_SPREAD = 8
 _LINK_NUM = {name: number for number, name in LINK_STATUS.items()}
 _MOD_NUM = {name: number for number, name in MODULATION.items()}
@@ -205,6 +205,7 @@ class Service:
             "period": int(_SINE_PERIOD),
             "spread": _SINE_SPREAD,
             "remotes": REMOTE_TAG_COUNT,
+            "every": int(_SINE_EVERY),
         }
 
     def set_sine(self, enabled: bool) -> dict:
@@ -224,6 +225,8 @@ class Service:
         return self.sine_view()
 
     async def _sine_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_at = loop.time()
         try:
             while self._sine_on:
                 try:
@@ -235,7 +238,11 @@ class Service:
                     # stopped it while the console still showed it as on.
                     log.exception("RSSI sine step failed")
                     self._trace(f"RSSI sine step failed: {exc}")
-                await asyncio.sleep(_SINE_EVERY)
+                # Fixed rate: start a step every _SINE_EVERY seconds, however
+                # long sending the traps took. If a step overran, start the
+                # next one right away rather than trying to catch up.
+                next_at = max(next_at + _SINE_EVERY, loop.time())
+                await asyncio.sleep(next_at - loop.time())
         except asyncio.CancelledError:
             return
 
