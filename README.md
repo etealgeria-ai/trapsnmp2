@@ -1,4 +1,6 @@
-# trapsnmp
+# trapsnmp2
+
+trapsnmp2 follows [trapsnmp](https://github.com/etealgeria-ai/trapsnmp) and adds a few fixes on top: the console is not access-logged, upstream outages are logged once, the upstream client closes when forwarding is switched off, only the newest 100 rejected client certificates are kept, EVENTS_COUNT wraps within UInt32, and Diagnose reconnects its loopback OPC UA session. The Python package is still `trapsnmp`, so it runs the same way.
 
 Comments in this README were made by Grok.
 
@@ -57,3 +59,14 @@ The RSSI sine stays stopped at startup. Start it from the Send page. Each step i
 - Only the newest 100 rejected OPC UA client certificates are kept in `data/pki/rejected`.
 - The last remote values are saved at most once a minute (about 130 KB with 255 remotes, roughly 200 MB of writes a day). That is fine for SSD or industrial flash; on a plain SD card, raise the 60-second interval in `Service.persist`.
 - The RSSI sine writes about 300 OPC UA nodes per trap (255 traps every 10 s). Leave it off on a production gateway.
+
+## Soak test
+
+`tools/soak_test.py` checks that a running gateway stays flat over a long run. It sends 5 SNMPv2c traps a second, records the gateway's memory, open files, and threads every 5 minutes, and prints FLAT or POSSIBLE LEAK at the end. It needs only the Python standard library (psutil on systems without `/proc`).
+
+```bash
+python3 tools/soak_test.py --pid $(pgrep -f "python.* -m trapsnmp") --hours 48 \
+  --console http://127.0.0.1:8080 --password 'P@ssw0rd'
+```
+
+Add `--target 127.0.0.1:1162` if the receiver listens on UDP 1162. Samples go to `soak.csv`; Ctrl+C stops early and still prints a verdict.
