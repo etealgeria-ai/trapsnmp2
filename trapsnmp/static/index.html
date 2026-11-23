@@ -26,6 +26,7 @@
       <p class="status" id="status">
         <span class="dot" id="status-dot"></span>
         <span id="status-text">Opening the trap receiver</span>
+        <button type="button" class="text-btn" id="sign-out">Sign out</button>
       </p>
     </header>
 
@@ -172,7 +173,7 @@
         <p class="hint">Simulated from MDS-IF-LN-MIB. The trap OID is the status object that changed, and the varbinds are the columns from that file.</p>
         <div class="presets" id="ge-presets"><!--GE-PRESETS--></div>
         <h3 class="subhead">RSSI sine</h3>
-        <p class="hint">One timer for Remote1 through Remote255, every 10 seconds. Every connected-remote column is sent in each trap. RSSI is the shared sine, −75 ± 15 dBm, plus a random ±8 dBm. The other items get their own random values.</p>
+        <p class="hint">One timer for Remote1 through Remote255, stepping every 10 seconds. Every connected-remote column is sent in each trap. RSSI is the shared sine, −75 ± 15 dBm, plus a random ±8 dBm. The other items get their own random values.</p>
         <div class="actions">
           <button type="button" class="primary" id="sine-toggle">Start RSSI sine</button>
         </div>
@@ -555,8 +556,11 @@
             <button type="submit" class="primary">Add user</button>
           </div>
         </form>
-        <h3 class="subhead">Rejected clients</h3>
-        <p class="hint">A secure client is rejected until its certificate is trusted. Trust moves it from data/pki/rejected to data/pki/trusted/certs.</p>
+        <h3 class="subhead">Accepted certificates</h3>
+        <p class="hint">Clients whose certificates are listed here may open a secure session. Reject moves one back to the rejected list. Delete removes it. Both lists are stored in data/pki and loaded again after a restart.</p>
+        <div id="cert-trusted"></div>
+        <h3 class="subhead">Rejected certificates</h3>
+        <p class="hint">A secure client is stored here until you accept it. Accept moves it to the trusted list. Delete removes it.</p>
         <div id="cert-rejected"></div>
         <h3 class="subhead">Forward as a client</h3>
         <p class="hint">Each new trap is also written, as JSON, to a node on any OPC UA server that accepts anonymous access.</p>
@@ -596,6 +600,19 @@
         </div>
         <div id="diag-report"></div>
       </section>
+    </div>
+    <div id="login" class="login" hidden>
+      <form id="login-form" class="login-card">
+        <p class="eyebrow">trapsnmp</p>
+        <h2>Sign in</h2>
+        <label class="field">
+          <span>Password</span>
+          <input type="password" name="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="primary">Sign in</button>
+        <p class="note" id="login-error"></p>
+        <p class="hint">This page is plain HTTP. Use it on a trusted network, or put it behind an HTTPS proxy.</p>
+      </form>
     </div>
     <script src="/static/app.js"></script>
   </body>

@@ -23,12 +23,15 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-from trapsnmp.paths import DATA_DIR
+from trapsnmp.settings import data_dir
 
 log = logging.getLogger("trapsnmp.pki")
 
-PKI_ROOT = DATA_DIR / "pki"
 APP_URI = "urn:trapsnmp:gateway"
+# A one-year certificate expired while the gateway kept running, and clients
+# then refused secure connections until the next restart.
+CERT_DAYS = 15 * 365
+RENEW_DAYS = 30
 _NAME = re.compile(r"^[0-9A-Fa-f]{40}\.der$")
 
 PROFILES = (
@@ -53,26 +56,18 @@ class Pki:
         self.validator = ClientCertValidator(self.trusted, self.rejected)
 
     @classmethod
-    async def ensure(cls, root: Path = PKI_ROOT) -> "Pki":
-        store = cls(root)
+    async def ensure(cls, root: Path | None = None) -> "Pki":
+        store = cls(root or (data_dir() / "pki"))
         for path in (store.cert_file.parent, store.trusted, store.crl, store.rejected):
             path.mkdir(parents=True, exist_ok=True)
-        if not store.key_file.is_file() or not store.cert_file.is_file():
+        if store.key_file.is_file():
+            os.chmod(store.key_file, 0o600)
+        if not store.key_file.is_file() or not store.cert_file.is_file() or store._renewal_due():
+            if store.cert_file.is_file():
+                log.info("Replacing the OPC UA certificate at %s", store.cert_file)
             store._create()
-            log.info("Created OPC UA certificate %s", store.cert_file)
-        elif store._expired():
-            # Clients reject an expired server certificate, so make a new one.
-            # Clients that trusted the old one must trust the new thumbprint.
-            store._create()
-            log.warning("OPC UA certificate had expired; created a new one at %s", store.cert_file)
+            log.info("OPC UA certificate is %s", store.cert_file)
         return store
-
-    def _expired(self) -> bool:
-        try:
-            return self.certificate().not_valid_after_utc <= datetime.now(timezone.utc)
-        except Exception:
-            log.warning("Could not read %s; creating a new certificate", self.cert_file, exc_info=True)
-            return True
 
     def _create(self) -> None:
         host = socket.gethostname() or "localhost"
@@ -92,9 +87,8 @@ class Pki:
             {"organizationName": "trapsnmp"},
             names,
             [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
-            days=365,
+            days=CERT_DAYS,
         )
-        # Only the gateway's own account may read the private key.
         descriptor = os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(dump_private_key_as_pem(key))
@@ -103,6 +97,22 @@ class Pki:
         except OSError:
             pass
         self.cert_file.write_bytes(certificate.public_bytes(Encoding.DER))
+
+    def days_left(self) -> int | None:
+        """Whole days until the application certificate expires, or None if unreadable."""
+        try:
+            expires = self.certificate().not_valid_after_utc
+        except Exception:
+            return None
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return (expires - datetime.now(timezone.utc)).days
+
+    def _renewal_due(self) -> bool:
+        if not self.cert_file.is_file():
+            return False
+        left = self.days_left()
+        return left is None or left <= RENEW_DAYS
 
     def certificate(self) -> x509.Certificate:
         return x509.load_der_x509_certificate(self.cert_file.read_bytes())
@@ -121,14 +131,33 @@ class Pki:
         }
 
     def trust(self, name: str) -> dict:
+        return self._move(name, self.rejected, self.trusted, "That certificate is not in the rejected list.")
+
+    def reject(self, name: str) -> dict:
+        return self._move(name, self.trusted, self.rejected, "That certificate is not in the trusted list.")
+
+    def delete(self, name: str, where: str) -> dict:
+        folder = {"trusted": self.trusted, "rejected": self.rejected}.get(where)
+        if folder is None:
+            raise ValueError("Unknown certificate list.")
+        path = folder / self._named(name)
+        if not path.is_file():
+            raise ValueError("That certificate is not in the list.")
+        path.unlink()
+        return self.summary()
+
+    def _named(self, name: str) -> str:
         if not _NAME.fullmatch(name or ""):
             raise ValueError("Unknown certificate.")
-        source = self.rejected / name
-        if not source.is_file():
-            raise ValueError("That certificate is not in the rejected list.")
-        target = self.trusted / name
-        target.write_bytes(source.read_bytes())
-        source.unlink()
+        return name
+
+    def _move(self, name: str, source: Path, dest: Path, missing: str) -> dict:
+        src = source / self._named(name)
+        if not src.is_file():
+            raise ValueError(missing)
+        dest.mkdir(parents=True, exist_ok=True)
+        _write_file(dest / src.name, src.read_bytes())
+        src.unlink()
         return self.summary()
 
 
@@ -145,10 +174,19 @@ class ClientCertValidator:
         if _matches(certificate, self.trusted):
             return
         self.rejected.mkdir(parents=True, exist_ok=True)
-        (self.rejected / f"{_thumb(certificate).replace(':', '')}.der").write_bytes(
-            certificate.public_bytes(Encoding.DER)
+        _write_file(
+            self.rejected / f"{_thumb(certificate).replace(':', '')}.der",
+            certificate.public_bytes(Encoding.DER),
         )
         raise ServiceError(ua.StatusCodes.BadCertificateUntrusted)
+
+
+def _write_file(path: Path, data: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _certs(folder: Path) -> list[Path]:

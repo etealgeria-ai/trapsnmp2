@@ -7,6 +7,10 @@ Boolean by writing false, and reset EVENTS_COUNT by writing a new value.
 
 from __future__ import annotations
 
+import logging
+
+log = logging.getLogger("trapsnmp.tags")
+
 SYS_UP = "1.3.6.1.2.1.1.3.0"
 TRAP_OID = "1.3.6.1.6.3.1.1.4.1.0"
 IF_INDEX = "1.3.6.1.2.1.2.2.1.1."
@@ -23,6 +27,10 @@ V2_AUTO = (
 V1_AUTO = (0, 1, 2, 3)
 
 EVENT_SLOTS = 10
+# Each new trap OID or port adds about 21 OPC UA nodes that are never removed.
+# Past this many extra addresses, traps still reach Latest, Recent, the event,
+# and EVENTS_001..010, but get no new TRAP_ tags.
+MAX_TRAP_TAGS = 2000
 FIELD_SLOTS = 20
 TABLE_ROWS = 20
 
@@ -154,6 +162,9 @@ class TrapTags:
         self.community = ""
         self.device_ip = ""
         self.bits: dict[str, bool] = {addr: False for addr in standard_addresses()}
+        self._standard = len(self.bits)
+        self.limit_hits = 0
+        self.limited_last = False
         self.queue: list[list[str]] = []
 
     def configure(self, *, community: str | None = None, device_ip: str | None = None) -> None:
@@ -219,7 +230,17 @@ class TrapTags:
                         "variant": "string",
                     }
                 )
+        self.limited_last = False
         for address in addresses_for(record):
+            if address not in self.bits and len(self.bits) - self._standard >= MAX_TRAP_TAGS:
+                self.limited_last = True
+                self.limit_hits += 1
+                if self.limit_hits == 1:
+                    log.warning(
+                        "Trap tag limit of %s reached; new trap OIDs and ports get no TRAP_ tags",
+                        MAX_TRAP_TAGS,
+                    )
+                continue
             if not self.bits.get(address):
                 self.bits[address] = True
                 updates.append({"address": address, "value": True, "variant": "bool"})
@@ -265,4 +286,7 @@ class TrapTags:
             "latestFields": latest[:8],
             "fieldCount": len(latest),
             "bits": shown + extras,
+            "tagLimit": MAX_TRAP_TAGS,
+            "tagsUsed": len(self.bits) - self._standard,
+            "tagLimitHits": self.limit_hits,
         }

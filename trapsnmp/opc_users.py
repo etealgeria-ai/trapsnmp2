@@ -25,17 +25,7 @@ class PasswordUsers:
         if not username:
             return User(role=UserRole.User)
         expected = self.passwords.get(username)
-        offered = password or ""
-        if isinstance(offered, (bytes, bytearray)):
-            offered = bytes(offered).decode("utf-8", "replace")
-        try:
-            # compare_digest only takes ASCII str, so compare UTF-8 bytes.
-            matched = expected is not None and secrets.compare_digest(
-                expected.encode("utf-8"), str(offered).encode("utf-8")
-            )
-        except Exception:
-            matched = False
-        if not matched:
+        if expected is None or not _same_secret(expected, password):
             return None
         return User(role=UserRole.User, name=username)
 
@@ -56,3 +46,14 @@ class PasswordUsers:
 
     def names(self) -> list[str]:
         return sorted(self.passwords)
+
+
+def _same_secret(expected: str, offered) -> bool:
+    try:
+        left = expected.encode("utf-8")
+        right = offered.encode("utf-8") if isinstance(offered, str) else bytes(offered or b"")
+    except Exception:
+        return False
+    if len(left) != len(right):
+        return False
+    return secrets.compare_digest(left, right)

@@ -6,15 +6,13 @@ import configparser
 import json
 import logging
 import os
+from pathlib import Path
 
 from trapsnmp.agent import COMPARISONS
-from trapsnmp.paths import DATA_DIR
-from trapsnmp.radios import MAX_REMOTES
+from trapsnmp.radios import _MAX_REMOTES
+from trapsnmp.snmp_in import _clean_user
 
 log = logging.getLogger("trapsnmp.settings")
-
-INI_PATH = DATA_DIR / "trapsnmp.ini"
-_JSON_PATH = DATA_DIR / "ge-master.json"
 
 _REMOTE_FIELDS = (
     "ifIndex",
@@ -68,6 +66,26 @@ _REMOTE_INTS = {
 }
 
 
+def data_dir() -> Path:
+    chosen = os.environ.get("TRAPSNMP_DATA", "").strip()
+    if chosen:
+        path = Path(chosen).expanduser()
+    elif Path("/workspace/data").is_dir():
+        path = Path("/workspace/data")
+    else:
+        path = Path("data")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def ini_path() -> Path:
+    return data_dir() / "trapsnmp.ini"
+
+
+def legacy_json_path() -> Path:
+    return data_dir() / "ge-master.json"
+
+
 def _parser() -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
@@ -90,20 +108,44 @@ def _int(value: str | None, default: int) -> int:
 def load(service) -> None:
     service._loading = True
     try:
-        if not INI_PATH.exists():
+        if ini_path().exists():
+            parser = _parser()
+            try:
+                parser.read(ini_path(), encoding="utf-8")
+            except (configparser.Error, UnicodeDecodeError) as exc:
+                _set_aside(service, exc)
+            else:
+                _apply(service, parser)
+        else:
             _migrate_master(service)
-            return
-        parser = _parser()
-        parser.read(INI_PATH, encoding="utf-8")
-        _apply(service, parser)
     finally:
         service._loading = False
-    if not INI_PATH.exists():
+    if ini_path().is_file():
+        try:
+            os.chmod(ini_path(), 0o600)
+        except OSError:
+            log.warning("Could not restrict permissions on %s", ini_path())
+    else:
         try:
             save(service)
         except OSError:
-            # Keep running with defaults; the console shows the next save error.
-            log.exception("Could not create %s", INI_PATH)
+            log.exception("Could not create %s", ini_path())
+
+
+def _set_aside(service, exc: Exception) -> None:
+    """Keep a file that cannot be read as trapsnmp.ini.bad and start with defaults."""
+    path = ini_path()
+    broken = path.with_name(path.name + ".bad")
+    try:
+        os.replace(path, broken)
+        where = f"; it was kept as {broken}"
+    except OSError:
+        where = ""
+    message = f"Could not read {path} ({exc.__class__.__name__}){where}. Started with defaults."
+    log.error("%s %s", message, exc)
+    trace = getattr(service, "_trace", None)
+    if callable(trace):
+        trace(message)
 
 
 def save(service) -> None:
@@ -158,6 +200,8 @@ def save(service) -> None:
             "community": dest.get("community", "public"),
             "version": dest.get("version", "2c"),
         }
+    parser["console"] = {"password": getattr(service, "console_password", "") or "P@ssw0rd"}
+    parser["sine"] = {"enabled": "true" if service._sine_on else "false"}
     for name, password in service.opc.users.passwords.items():
         parser[f"opc.user.{name}"] = {"password": password}
     for index, row in enumerate(service.radios.remotes, start=1):
@@ -172,21 +216,23 @@ def save(service) -> None:
                 section[key] = str(value)
         if section:
             parser[f"remote.{index}"] = section
-    INI_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Write a temporary file and swap it in, so a crash or power loss mid-write
-    # never leaves a truncated settings file behind.
-    temp = INI_PATH.with_name(INI_PATH.name + ".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
+    path = ini_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".ini.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write("; trapsnmp settings. Loaded automatically on the next start.\n")
         parser.write(handle)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp, INI_PATH)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
 
 
 def _migrate_master(service) -> None:
     try:
-        saved = json.loads(_JSON_PATH.read_text(encoding="utf-8"))
+        saved = json.loads(legacy_json_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
     if not isinstance(saved, dict):
@@ -216,6 +262,14 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
                 "privKey": item.get("priv_key", ""),
             }
         )
+    valid = []
+    for profile in users:
+        try:
+            valid.append(_clean_user(profile))
+        except (KeyError, ValueError) as exc:
+            # One bad user used to stop the whole trap receiver at start.
+            log.warning("Skipping SNMPv3 user %r in %s: %s", profile.get("name"), ini_path(), exc)
+    users = valid
     if users:
         service.snmp.users = users
     if parser.has_section("master"):
@@ -239,7 +293,7 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
         if comparison in COMPARISONS:
             agent.comparison = comparison
         elif comparison:
-            log.warning("Ignoring unknown agent comparison %r in %s", comparison, INI_PATH)
+            log.warning("Ignoring unknown agent comparison %r in %s", comparison, ini_path())
         agent.threshold = _int(item.get("threshold"), agent.threshold)
         agent.description = item.get("description", agent.description)
         agent.contact = item.get("contact", "")
@@ -278,8 +332,13 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
         )
     if numbered:
         service.agent.destinations = destinations
-    # A [sine] section from an older file is ignored: the RSSI sine always
-    # starts stopped and is started from the Send page.
+    if parser.has_section("console"):
+        password = parser["console"].get("password", "")
+        if password:
+            service.console_password = password
+            service._console_from_file = True
+    # A [sine] section from an older file is ignored. The RSSI sine starts
+    # stopped and is started from the Send page.
     opc_users: dict[str, str] = {}
     for section in parser.sections():
         if section.startswith("opc.user."):
@@ -312,11 +371,9 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
                 row[key] = raw
         if row:
             remotes.append(row)
-    # Older files may hold more remotes than there are Remote tags now.
-    remotes = remotes[:MAX_REMOTES]
     if remotes:
-        service.radios.remotes = remotes
-        for index, row in enumerate(remotes, start=1):
+        service.radios.remotes = remotes[:_MAX_REMOTES]
+        for index, row in enumerate(service.radios.remotes, start=1):
             stats = {}
             for key in ("txPackets", "txBytes", "rxPackets", "rxBytes", "txError", "rxError", "txDrop", "rxDrop"):
                 if key in row:

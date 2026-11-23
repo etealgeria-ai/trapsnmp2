@@ -1,6 +1,4 @@
-# trapsnmp2
-
-A debugged copy of [trapsnmp](https://github.com/etealgeria-ai/trapsnmp). The Python package is still called `trapsnmp`, so it runs the same way. See [Fixes in trapsnmp2](#fixes-in-trapsnmp2) below.
+# trapsnmp
 
 Comments in this README were made by Grok.
 
@@ -17,7 +15,7 @@ pip install -r requirements.txt
 python -m trapsnmp
 ```
 
-- Console: `http://127.0.0.1:8080/`
+- Console: `http://127.0.0.1:8080/` — sign in with password `P@ssw0rd`
 - SNMP traps: UDP 162, or 1162 if 162 is unavailable
 - OPC UA: `opc.tcp://127.0.0.1:4840/trapsnmp/`
 - Namespace: `urn:trapsnmp:snmp`
@@ -30,35 +28,30 @@ The built-in SNMP agent answers Get, GetNext, GetBulk, and Set on UDP 1161, and 
 
 ## GE Orbit radios
 
-The Radios page polls a GE Orbit LN master (`mIfLnStatusConnRemTable`) and writes each connected radio into `Remote1` through `Remote255`. Radios past the 255th are not published. Every remote has the short tags (`remote_mac`, `remote_ip`, `rssi`, `down`, `if_index`) plus one tag per column of `mIfLnStatusConnRemEntry` in MDS-IF-LN-MIB. The master IP, community, port, and poll interval are set on the Config page.
+The Radios page polls a GE Orbit LN master (`mIfLnStatusConnRemTable`) and writes each connected radio into `Remote1` through `Remote255`. Every remote has the short tags (`remote_mac`, `remote_ip`, `rssi`, `down`, `if_index`) plus one tag per column of `mIfLnStatusConnRemEntry` in MDS-IF-LN-MIB. The master IP, community, port, and poll interval are set on the Config page.
 
-The Send page can simulate those columns for Remote1 through Remote255 every 10 seconds, one trap per remote, on one RSSI sine wave, with a random offset per remote. The sine is always stopped when the gateway starts; start it from the Send page.
+The Send page can simulate those columns for Remote1 through Remote255 on one RSSI sine wave, with a random offset per remote. The wave period is 30 seconds and the step is 10 seconds. It stays stopped until you start it.
 
 ## OPC UA security
 
-The server still accepts an anonymous session on security None. It also offers Basic256Sha256, Aes128-SHA256-RSA-OAEP, and Aes256-SHA256-RSA-PSS, in Sign and SignAndEncrypt. The application certificate is created on first start under `data/pki/own/`. A client certificate that is not trusted is stored in `data/pki/rejected` and can be trusted from the Publish page.
+The server still accepts an anonymous session on security None. It also offers Basic256Sha256, Aes128-SHA256-RSA-OAEP, and Aes256-SHA256-RSA-PSS, in Sign and SignAndEncrypt. The application certificate is created on first start under `data/pki/own/`. A client certificate that is not trusted is stored in `data/pki/rejected` and can be accepted from the Publish page. Accepted certificates are stored in `data/pki/trusted/certs`. Accept, reject, and delete are written to disk and loaded again on the next start.
 
 A username token is offered as well. On the open endpoint the password is encrypted with Basic256Sha256 and the server certificate. The first user is `trapsnmp` / `trapsnmp`.
 
 ## Settings
 
-Communities, SNMPv3 users, the GE master, the agent, tag filters, upstream OPC UA, OPC UA users, and the last remote values are stored in `data/trapsnmp.ini` and loaded on the next start. The private key is not written into that file. Remote values are saved at most once a minute; configuration changes are saved immediately.
+Communities, SNMPv3 users, the GE master, the agent, tag filters, upstream OPC UA, OPC UA users, and the last remote values are stored in `data/trapsnmp.ini` and loaded on the next start. The file is mode `0600`. Set `TRAPSNMP_DATA` to choose that folder. Otherwise an existing `/workspace/data` is used, then `./data`. The private key is not written into that file.
 
-The data folder is `TRAPSNMP_DATA` if that variable is set, otherwise `/workspace/data` if it already exists (older installs), otherwise `data/` under the working directory. The path is logged at startup.
+The console password is `P@ssw0rd`. It is stored in `[console]` of `data/trapsnmp.ini`. Use `P@ssw0rd` to sign in. Edit that line and restart only if you want a different password. Ten wrong passwords from one address lock it out for 5 minutes. Wrong passwords are forgotten after an hour, and a sign-in lasts 12 hours. The console is plain HTTP, so use it on a trusted network or behind an HTTPS proxy.
 
-## Fixes in trapsnmp2
+The RSSI sine stays stopped at startup. Start it from the Send page. Each step is 10 seconds.
 
-- Settings and certificates no longer require `/workspace/data`; the gateway used to crash at start on machines without it. See the data folder note above.
-- The GE Orbit poller reuses one SNMP engine. A new engine per poll left a UDP socket and a timer task running every time.
-- Remote tags reduced to `Remote1`–`Remote255`, and the poller keeps exactly that many (it stopped at 256 while tags went to `Remote999`). Remote values saved by an older version beyond 255 are dropped on load.
-- Remote values are saved once a minute instead of every 2 seconds, and the settings file is written atomically.
-- The radio poller and the RSSI sine keep running after a failed step instead of stopping silently.
-- Upstream OPC UA forwarding uses one connection at a time, times out after 2 s, and pauses 10 s after a failure, so a dead upstream no longer stalls every trap.
-- Console test traps: SNMPv1 enterprise-specific traps are no longer reported as "not accepted", and a look-alike trap cannot be mistaken for the one just sent.
-- Removing an agent community now stops it from working right away.
-- Console POST requests must be `application/json`, which blocks cross-site form posts.
-- OPC UA passwords with non-ASCII characters work; the private key file is `0600`; an expired application certificate is replaced at start.
-- `Recent` has its own folder in the OPC UA browser instead of showing under Tags.
-- The console makes one `/api/state` request at a time, and the response no longer carries every remote twice.
+## Running continuously
 
-Not changed yet: the console still has no login and listens on all interfaces, and the RSSI sine still sends 255 loopback traps every 10 s.
+- Memory stays flat under steady trap traffic. Lists, logs, sessions, and queues all have fixed sizes.
+- Each new trap OID or port number adds about 21 OPC UA nodes under `Tags`, and they are kept until restart. After 2,000 such addresses (about 42,000 nodes), new ones get no `TRAP_` tags; their traps still reach `Latest`, `Recent`, `EVENTS_001`–`EVENTS_010`, and the event, and the trace says "trap tag limit reached". Raise `MAX_TRAP_TAGS` in `trap_tags.py` if your devices need more.
+- Each SNMPv3 sender engine ID gets its own copy of the user; at most 1,024 are kept, oldest dropped first.
+- The OPC UA certificate is valid for 15 years. Within 30 days of expiry the gateway warns once a day in the log and trace, and a restart renews it (clients then trust the new one).
+- An unreachable GE master is logged once when polling starts failing and once when it recovers.
+- Logs go to standard output. Run the gateway under systemd or another service manager that rotates logs.
+- The RSSI sine writes about 300 OPC UA nodes per trap (255 traps every 10 s). Leave it off on a production gateway.

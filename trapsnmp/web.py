@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import logging
+import secrets
+import time
 from html import escape
 from pathlib import Path
 
@@ -15,6 +20,14 @@ log = logging.getLogger("trapsnmp.web")
 
 STATIC = Path(__file__).resolve().parent / "static"
 INDEX = (STATIC / "index.html").read_text(encoding="utf-8")
+_COOKIE = "trapsnmp"
+_SESSION_SECONDS = 12 * 60 * 60
+_MAX_SESSIONS = 100
+_FAIL_DELAY = 1.0
+_FAIL_LIMIT = 10
+_LOCKOUT_SECONDS = 5 * 60
+_FAIL_FORGET_SECONDS = 60 * 60  # wrong passwords older than this no longer count
+_ADDRESS_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _preset_buttons(items) -> str:
@@ -51,13 +64,113 @@ def _json_error(message: str, status: int = 400) -> web.Response:
 
 
 @web.middleware
-async def _require_json(request: web.Request, handler):
+async def _json_posts(request: web.Request, handler):
     # A page on another site can POST text/plain without a CORS preflight,
-    # and request.json() would still parse it. Requiring application/json
-    # forces a preflight, which this server never approves.
+    # and request.json() would still parse it. Only application/json is accepted.
     if request.method == "POST" and request.content_type != "application/json":
         return _json_error("Send JSON with Content-Type: application/json.", 415)
     return await handler(request)
+
+
+def _password_ok(got: str, expected: str) -> bool:
+    return hmac.compare_digest(
+        hashlib.sha256(got.encode("utf-8")).digest(),
+        hashlib.sha256(expected.encode("utf-8")).digest(),
+    )
+
+
+def _open_path(request: web.Request) -> bool:
+    if request.method == "GET" and (
+        request.path in ("/", "/favicon.svg") or request.path.startswith("/static/")
+    ):
+        return True
+    return request.method == "POST" and request.path == "/api/login"
+
+
+def _new_session(sessions: dict[str, float]) -> str:
+    now = time.monotonic()
+    for token, expires in list(sessions.items()):
+        if expires <= now:
+            del sessions[token]
+    while len(sessions) >= _MAX_SESSIONS:
+        del sessions[min(sessions, key=sessions.get)]
+    token = secrets.token_urlsafe(32)
+    sessions[token] = now + _SESSION_SECONDS
+    return token
+
+
+@web.middleware
+async def _require_login(request: web.Request, handler):
+    if _open_path(request):
+        return await handler(request)
+    token = request.cookies.get(_COOKIE, "")
+    sessions: dict[str, float] = request.app["sessions"]
+    expires = sessions.get(token) if token else None
+    if expires is not None and expires > time.monotonic():
+        return await handler(request)
+    if expires is not None:
+        sessions.pop(token, None)
+    return _json_error("Sign in required.", 401)
+
+
+def _forget_old_failures(failures: dict[str, tuple[int, float, float]], now: float) -> None:
+    for key, (_count, until, last) in list(failures.items()):
+        if until <= now and now - last > _FAIL_FORGET_SECONDS:
+            del failures[key]
+            gate = _ADDRESS_LOCKS.get(key)
+            if gate is not None and not gate.locked():
+                _ADDRESS_LOCKS.pop(key, None)
+
+
+async def _check_login(request, service, body, failures, address, gate) -> web.Response:
+    async with gate:
+        now = time.monotonic()
+        count, locked_until, _last = failures.get(address, (0, 0.0, 0.0))
+        if locked_until > now:
+            minutes = max(1, round((locked_until - now) / 60))
+            return _json_error(f"Too many wrong passwords. Try again in {minutes} min.", 429)
+        if not _password_ok(str(body.get("password") or ""), service.console_password):
+            count += 1
+            locked_until = now + _LOCKOUT_SECONDS if count >= _FAIL_LIMIT else 0.0
+            failures[address] = (0 if locked_until else count, locked_until, now)
+            if locked_until:
+                log.warning("console sign-in locked for %s after %s wrong passwords", address, count)
+            await asyncio.sleep(_FAIL_DELAY)
+            if locked_until:
+                return _json_error("Too many wrong passwords. Try again in 5 min.", 429)
+            return _json_error("Wrong password.", 401)
+        failures.pop(address, None)
+        token = _new_session(request.app["sessions"])
+    response = web.json_response({"ok": True})
+    response.set_cookie(_COOKIE, token, httponly=True, samesite="Lax", path="/", max_age=_SESSION_SECONDS)
+    return response
+
+
+async def handle_login(request: web.Request) -> web.Response:
+    service: Service = request.app["service"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error("Expected JSON.")
+    if not isinstance(body, dict):
+        return _json_error("Expected a JSON object.")
+    failures: dict[str, tuple[int, float, float]] = request.app["login_failures"]
+    address = request.remote or "?"
+    _forget_old_failures(failures, time.monotonic())
+    gate = _ADDRESS_LOCKS.setdefault(address, asyncio.Lock())
+    try:
+        return await _check_login(request, service, body, failures, address, gate)
+    finally:
+        if address not in failures and not gate.locked() and not getattr(gate, "_waiters", None):
+            _ADDRESS_LOCKS.pop(address, None)
+
+
+async def handle_logout(request: web.Request) -> web.Response:
+    token = request.cookies.get(_COOKIE, "")
+    request.app["sessions"].pop(token, None)
+    response = web.json_response({"ok": True})
+    response.del_cookie(_COOKIE, path="/")
+    return response
 
 
 async def handle_index(_request: web.Request) -> web.Response:
@@ -80,7 +193,10 @@ async def handle_opc_user(request: web.Request) -> web.Response:
         if body.get("action") == "remove":
             service.opc.users.remove(str(body.get("name") or ""))
         else:
-            service.opc.users.add(str(body.get("name") or ""), str(body.get("password") or ""))
+            password = body.get("password")
+            if not isinstance(password, str):
+                raise ValueError("Password must be 8–64 characters.")
+            service.opc.users.add(str(body.get("name") or ""), password)
     except ValueError as exc:
         return _json_error(str(exc))
     service.persist()
@@ -95,10 +211,19 @@ async def handle_pki(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return _json_error("Expected JSON.")
-    if not isinstance(body, dict) or body.get("action") != "trust":
-        return _json_error("Expected a trust action.")
+    if not isinstance(body, dict):
+        return _json_error("Expected a JSON object.")
+    action = str(body.get("action") or "")
+    name = str(body.get("name") or "")
     try:
-        summary = service.opc.pki.trust(str(body.get("name") or ""))
+        if action == "trust":
+            summary = service.opc.pki.trust(name)
+        elif action == "reject":
+            summary = service.opc.pki.reject(name)
+        elif action == "delete":
+            summary = service.opc.pki.delete(name, str(body.get("list") or ""))
+        else:
+            return _json_error("Expected a trust, reject, or delete action.")
     except ValueError as exc:
         return _json_error(str(exc))
     return web.json_response({"ok": True, "certificate": summary})
@@ -118,7 +243,9 @@ async def handle_favicon(_request: web.Request) -> web.Response:
 
 async def handle_state(request: web.Request) -> web.Response:
     service: Service = request.app["service"]
-    return web.json_response(await service.snapshot())
+    response = web.json_response(await service.snapshot())
+    response.enable_compression()
+    return response
 
 
 async def handle_inject(request: web.Request) -> web.Response:
@@ -315,10 +442,14 @@ def _optional_str(value) -> str | None:
 
 
 async def serve(service: Service) -> None:
-    app = web.Application(client_max_size=1024 * 256, middlewares=[_require_json])
+    app = web.Application(client_max_size=1024 * 256, middlewares=[_json_posts, _require_login])
     app["service"] = service
+    app["sessions"] = {}
+    app["login_failures"] = {}
     app.router.add_get("/", handle_index)
     app.router.add_get("/favicon.svg", handle_favicon)
+    app.router.add_post("/api/login", handle_login)
+    app.router.add_post("/api/logout", handle_logout)
     app.router.add_get("/api/state", handle_state)
     app.router.add_get("/api/opc", handle_opc)
     app.router.add_post("/api/pki", handle_pki)

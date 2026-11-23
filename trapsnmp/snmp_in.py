@@ -6,6 +6,7 @@ import asyncio
 import logging
 import socket
 import time
+from collections import OrderedDict
 from typing import Awaitable, Callable
 
 from pyasn1.codec.ber import decoder
@@ -38,6 +39,20 @@ from pysnmp.smi.error import NoSuchInstanceError
 from trapsnmp.tasks import spawn
 
 log = logging.getLogger("trapsnmp.snmp")
+
+_MAX_IN_FLIGHT = 64
+# Each SNMPv3 sender engine ID gets its own copy of a user. The user name is
+# not secret, so without a cap any host could grow this table forever.
+_MAX_V3_CLONES = 1024
+
+# pysnmp counts messages it rejects before they become traps.
+_REJECT_COUNTERS = (
+    ("__SNMPv2-MIB", "snmpInBadCommunityNames", "badCommunity"),
+    ("__SNMP-USER-BASED-SM-MIB", "usmStatsUnknownUserNames", "unknownUser"),
+    ("__SNMP-USER-BASED-SM-MIB", "usmStatsWrongDigests", "wrongAuth"),
+    ("__SNMP-USER-BASED-SM-MIB", "usmStatsDecryptionErrors", "wrongPriv"),
+    ("__SNMP-USER-BASED-SM-MIB", "usmStatsUnsupportedSecLevels", "wrongLevel"),
+)
 
 OnTrap = Callable[[dict, list[tuple[str, str, str]]], Awaitable[None]]
 
@@ -112,6 +127,9 @@ class SnmpTrapIn:
         self._sender: SnmpEngine | None = None
         self._sink: dict = {}
         self._send_lock = asyncio.Lock()
+        self._inflight = 0
+        self.dropped = 0
+        self._clones: OrderedDict[tuple[bytes, bytes], None] = OrderedDict()
 
     async def start(self, ports: tuple[int, ...] = (162, 1162)) -> None:
         try:
@@ -256,13 +274,13 @@ class SnmpTrapIn:
             priv_key,
         )
 
-    @staticmethod
-    def _arm_v3_clone(snmp_engine: engine.SnmpEngine) -> None:
+    def _arm_v3_clone(self, snmp_engine: engine.SnmpEngine) -> None:
         """Localize a known user onto the sender's engine ID before USM checks it."""
         original = snmp_engine.msgAndPduDsp.receiveMessage
+        clones = self._clones
 
         def wrapped(engine_arg, transport_domain, transport_address, whole_msg):
-            _clone_v3_user(engine_arg, whole_msg)
+            _clone_v3_user(engine_arg, whole_msg, clones)
             return original(engine_arg, transport_domain, transport_address, whole_msg)
 
         snmp_engine.msgAndPduDsp.receiveMessage = wrapped
@@ -312,10 +330,48 @@ class SnmpTrapIn:
             "user": sink.get("user", ""),
             "securityLevel": sink.get("securityLevel", ""),
         }
+        if self._inflight >= _MAX_IN_FLIGHT:
+            self.dropped += 1
+            if self.dropped == 1 or self.dropped % 100 == 0:
+                log.warning("trap backlog is full; dropped %s", self.dropped)
+            return
+        self._inflight += 1
         try:
-            spawn(self._dispatch(snap, rows), name="trap-dispatch")
+            task = spawn(self._dispatch(snap, rows), name="trap-dispatch")
         except RuntimeError:
+            self._inflight -= 1
+            self.dropped += 1
             log.exception("trap dropped; no running loop")
+            return
+        task.add_done_callback(self._release_trap)
+
+    def _release_trap(self, _task: asyncio.Task) -> None:
+        self._inflight = max(0, self._inflight - 1)
+
+    @property
+    def in_flight(self) -> int:
+        return self._inflight
+
+    @property
+    def max_in_flight(self) -> int:
+        return _MAX_IN_FLIGHT
+
+    def rejected(self) -> dict[str, int]:
+        """Messages refused for a bad community or SNMPv3 credentials."""
+        counts: dict[str, int] = {}
+        if self._engine is None:
+            return counts
+        try:
+            builder = self._engine.getMibBuilder()
+        except Exception:
+            return counts
+        for module, symbol, key in _REJECT_COUNTERS:
+            try:
+                (node,) = builder.importSymbols(module, symbol)
+                counts[key] = int(node.syntax)
+            except Exception:
+                continue
+        return counts
 
     async def _dispatch(self, snap: dict, rows: list[tuple[str, str, str]]) -> None:
         try:
@@ -324,7 +380,11 @@ class SnmpTrapIn:
             log.exception("trap handler failed")
 
 
-def _clone_v3_user(snmp_engine: engine.SnmpEngine, whole_msg: bytes) -> None:
+def _clone_v3_user(
+    snmp_engine: engine.SnmpEngine,
+    whole_msg: bytes,
+    clones: OrderedDict | None = None,
+) -> None:
     try:
         message = decoder.decode(whole_msg, asn1Spec=SNMPv3Message())[0]
     except Exception:
@@ -345,8 +405,11 @@ def _clone_v3_user(snmp_engine: engine.SnmpEngine, whole_msg: bytes) -> None:
         return
     usm = snmp_engine.securityModels[3]
     controller = snmp_engine.msgAndPduDsp.mibInstrumController
+    key = (bytes(engine_id), bytes(user_name))
     try:
         usm._SnmpUSMSecurityModel__getUserInfo(controller, engine_id, user_name)
+        if clones is not None and key in clones:
+            clones.move_to_end(key)
         return
     except NoSuchInstanceError:
         pass
@@ -354,6 +417,20 @@ def _clone_v3_user(snmp_engine: engine.SnmpEngine, whole_msg: bytes) -> None:
         usm._SnmpUSMSecurityModel__cloneUserInfo(controller, engine_id, user_name)
     except Exception:
         log.debug("USM user was not cloned for this engine", exc_info=True)
+        return
+    if clones is None:
+        return
+    clones[key] = None
+    while len(clones) > _MAX_V3_CLONES:
+        (old_engine, old_user), _ = clones.popitem(last=False)
+        try:
+            config.delV3User(
+                snmp_engine,
+                old_user.decode("utf-8", "replace"),
+                securityEngineId=old_engine,
+            )
+        except Exception:
+            log.debug("could not drop the oldest SNMPv3 user copy", exc_info=True)
 
 
 def _usm(profile: dict) -> UsmUserData:

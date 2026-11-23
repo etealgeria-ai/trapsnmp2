@@ -275,19 +275,28 @@ class SnmpAgent:
                 write_tree,
             )
 
-    def _unregister_community(self, snmp_engine, item: dict) -> None:
-        """Stop a removed community from working before the next restart."""
+    def _unregister_community(self, item: dict) -> None:
+        if self._engine is None:
+            return
         name = item["name"]
         read_tree = (1, 3, 6, 1)
         write_tree = read_tree if item.get("rights") == "read-write" else ()
         try:
-            for model in (1, 2):
-                config.delVacmUser(snmp_engine, model, name, "noAuthNoPriv", read_tree, write_tree)
-            config.delV1System(snmp_engine, name)
+            config.delV1System(self._engine, name)
         except Exception:
-            log.warning(
-                "Could not unregister community %s; it stays valid until restart", name, exc_info=True
-            )
+            log.warning("could not remove community %s from the agent", name, exc_info=True)
+        for model in (1, 2):
+            try:
+                config.delVacmUser(
+                    self._engine,
+                    model,
+                    name,
+                    "noAuthNoPriv",
+                    read_tree,
+                    write_tree,
+                )
+            except Exception:
+                log.warning("could not remove access for community %s", name, exc_info=True)
 
     def _arm_host_filter(self, snmp_engine) -> None:
         original = snmp_engine.msgAndPduDsp.receiveMessage
@@ -394,11 +403,10 @@ class SnmpAgent:
         if kind == "community":
             if key in ("public", "private"):
                 raise ValueError("The built-in communities stay in the list.")
-            removed = [item for item in self.communities if item["name"] == key]
+            current = next((item for item in self.communities if item["name"] == key), None)
+            if current is not None:
+                self._unregister_community(current)
             self.communities = [item for item in self.communities if item["name"] != key]
-            if self._engine is not None:
-                for item in removed:
-                    self._unregister_community(self._engine, item)
             return
         if kind == "destination":
             self.destinations = [
@@ -406,10 +414,6 @@ class SnmpAgent:
             ]
             return
         raise ValueError("Unknown remove target.")
-
-    def _own_trap(self, oid: str) -> bool:
-        root = self.object_id()
-        return oid == root or oid.startswith(root + ".")
 
     def observe(self, record: dict) -> None:
         oid = str(record.get("trapOid") or "")
@@ -425,16 +429,25 @@ class SnmpAgent:
         values["message"] = message
         values["version"] = record.get("version") or ""
 
+    def _own_trap(self, oid: str) -> bool:
+        root = self.object_id()
+        return oid == root or oid.startswith(root + ".")
+
     def triggered(self, severity: int) -> bool:
         threshold = self.threshold
-        return {
+        rules = {
             "Source > Threshold": severity > threshold,
             "Source >= Threshold": severity >= threshold,
             "Source < Threshold": severity < threshold,
             "Source <= Threshold": severity <= threshold,
             "Source == Threshold": severity == threshold,
             "Source != Threshold": severity != threshold,
-        }[self.comparison]
+        }
+        rule = rules.get(self.comparison)
+        if rule is None:
+            self.last_notify = "Trigger comparison is not recognized"
+            return False
+        return rule
 
     async def maybe_notify(self, record: dict) -> None:
         oid = str(record.get("trapOid") or "")
@@ -511,7 +524,7 @@ class SnmpAgent:
         values = self._store["values"]
         ticks = int((time.monotonic() - self._store["booted"]) * 100) % 4_294_967_295
         system = []
-        for label, _sub, detail in SYSTEM_OBJECTS:
+        for label, sub, detail in SYSTEM_OBJECTS:
             local = self.local_oid(label)
             rfc = RFC1213.get(label)
             shown = str(ticks) if label == "sysUpTime" else str(values.get(label, ""))

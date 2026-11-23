@@ -12,7 +12,7 @@ from asyncua import Client, Server, ua
 
 from trapsnmp.opc_users import USER_POLICY, PasswordUsers
 from trapsnmp.pki import PROFILES, Pki
-from trapsnmp.radios import MAX_REMOTES, OPC_TAGS, remote_opc_values
+from trapsnmp.radios import OPC_TAGS, remote_opc_values
 from trapsnmp.trap_tags import startup_nodes
 
 log = logging.getLogger("trapsnmp.opcua")
@@ -27,11 +27,7 @@ _TAG_INITIAL = {"bool": False, "string": "", "int": 0, "uint": 0}
 
 NS_URI = "urn:trapsnmp:snmp"
 SLOT_COUNT = 8
-REMOTE_TAG_COUNT = MAX_REMOTES
-# Upstream forwarding: how long one connect or write may take, and how long
-# to skip forwarding after a failure instead of stalling every trap.
-_FORWARD_TIMEOUT = 2.0
-_FORWARD_RETRY_AFTER = 10.0
+REMOTE_TAG_COUNT = 255
 
 LATEST_FIELDS = (
     ("Source", ua.VariantType.String, ""),
@@ -86,7 +82,8 @@ class OpcuaBridge:
         self._forwarder: Client | None = None
         self._forward_url = ""
         self._forward_lock = asyncio.Lock()
-        self._forward_retry_at = 0.0
+        self._forward_pause_until = 0.0
+        self._forward_pause_reason = ""
         self._read_lock = asyncio.Lock()
         self._tag_store = None
         self._tags_parent = None
@@ -364,20 +361,20 @@ class OpcuaBridge:
         ns = self.namespace_index or 2
         folders: list[str] = []
         if folder == "trapsnmp":
-            folders = ["Latest", "Recent", "Gateway", "Upstream", "Radios", "Tags"]
+            folders = ["Latest", "Gateway", "Upstream", "Recent", "Radios", "Tags"]
             keys: list[str] = []
         elif folder == "Radios":
             folders = [f"Remote{number}" for number in range(1, REMOTE_TAG_COUNT + 1)]
             keys = [key for key in self.nodes if key.startswith("Radios.")]
-        elif folder.startswith("Remote") and folder[6:].isdigit():
+        elif folder.startswith("Remote") and folder[6:].isdigit() and 1 <= int(folder[6:]) <= REMOTE_TAG_COUNT:
             keys = [key for key in self.nodes if key.startswith(folder + ".")]
-        elif folder in ("Latest", "Recent", "Gateway", "Upstream"):
+        elif folder in ("Latest", "Gateway", "Upstream", "Recent"):
             keys = [key for key in self.nodes if key.startswith(folder + ".")]
         elif folder == "Tags":
             keys = [
                 key
                 for key in self.nodes
-                if not key.startswith(("Latest.", "Recent.", "Gateway.", "Upstream.", "Radios.", "Remote"))
+                if not key.startswith(("Latest.", "Gateway.", "Upstream.", "Recent.", "Radios.", "Remote"))
             ]
         else:
             return {"ok": False, "error": "Unknown folder.", "folders": [], "items": []}
@@ -443,7 +440,14 @@ class OpcuaBridge:
         else:
             self.upstream["status"] = "Armed"
         self._forward_url = ""
-        self._forward_retry_at = 0.0
+        self._forward_pause_until = 0.0
+        self._forward_pause_reason = ""
+
+    def _forward_failed(self, reason: str) -> str:
+        text = (reason or "Upstream did not answer").strip() or "Upstream did not answer"
+        self.upstream["failed"] += 1
+        self.upstream["status"] = text
+        return "failed"
 
     async def _forward(self, trap: dict) -> str:
         payload = {
@@ -463,26 +467,26 @@ class OpcuaBridge:
             "varbinds": trap["varbinds"],
         }
         encoded = json.dumps(payload, separators=(",", ":"))
-        # One forward at a time: concurrent traps would otherwise each open
-        # their own client and leak all but the last session.
-        async with self._forward_lock:
-            if time.monotonic() < self._forward_retry_at:
-                self.upstream["failed"] += 1
-                return "failed"
-            try:
-                client = await self._forward_client()
+        if time.monotonic() < self._forward_pause_until:
+            return self._forward_failed(self._forward_pause_reason)
+        try:
+            async with self._forward_lock:
+                if time.monotonic() < self._forward_pause_until:
+                    return self._forward_failed(self._forward_pause_reason)
+                client = await asyncio.wait_for(self._forward_client(), 4.0)
                 node = client.get_node(self.upstream["nodeId"])
-                await asyncio.wait_for(
-                    node.write_value(encoded, ua.VariantType.String), _FORWARD_TIMEOUT
-                )
-            except Exception as exc:
-                self.upstream["failed"] += 1
-                self.upstream["status"] = str(exc) or type(exc).__name__
-                self._forward_retry_at = time.monotonic() + _FORWARD_RETRY_AFTER
-                await self._drop_forwarder()
-                log.warning("upstream write failed: %s", self.upstream["status"])
-                return "failed"
-            self._forward_retry_at = 0.0
+                await asyncio.wait_for(node.write_value(encoded, ua.VariantType.String), 4.0)
+        except Exception as exc:
+            reason = str(exc).strip() or "Upstream did not answer"
+            self._forward_pause_until = time.monotonic() + 10
+            self._forward_pause_reason = reason
+            try:
+                async with self._forward_lock:
+                    await self._drop_forwarder()
+            except Exception:
+                log.exception("could not close the upstream client")
+            log.warning("upstream write failed: %s", reason)
+            return self._forward_failed(reason)
         self.upstream["forwarded"] += 1
         self.upstream["status"] = "Last write succeeded"
         try:
@@ -665,15 +669,10 @@ class OpcuaBridge:
         if not self.ready or address not in self.node_ids:
             return None
         async with self._read_lock:
-            try:
-                if self._reader is None:
-                    await self._connect_reader()
-                return await self._reader.get_node(self.node_ids[address]).read_value()
-            except Exception:
-                # The loopback session may have dropped; reconnect once.
-                await self._drop_reader()
+            if self._reader is None:
                 await self._connect_reader()
-                return await self._reader.get_node(self.node_ids[address]).read_value()
+            node = self._reader.get_node(self.node_ids[address])
+            return await node.read_value()
 
     async def _write(self, key: str, value, variant: ua.VariantType) -> None:
         await self.nodes[key].write_value(value, variant)
@@ -708,11 +707,11 @@ class OpcuaBridge:
         if self._forwarder is not None and self._forward_url == url:
             return self._forwarder
         await self._drop_forwarder()
-        client = Client(url, timeout=_FORWARD_TIMEOUT)
-        client.session_timeout = 600_000
+        client = Client(url)
+        client.session_timeout = 10_000
         try:
-            await asyncio.wait_for(client.connect(), _FORWARD_TIMEOUT * 2)
-        except Exception:
+            await client.connect()
+        except BaseException:
             try:
                 await client.disconnect()
             except Exception:

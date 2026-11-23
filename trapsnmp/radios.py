@@ -28,8 +28,7 @@ log = logging.getLogger("trapsnmp.radios")
 
 ENTRY = "1.3.6.1.4.1.4130.10.2.5.1.2.2.1"
 _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")
-# One OPC UA folder per remote, Remote1 through Remote255.
-MAX_REMOTES = 255
+_MAX_REMOTES = 255
 
 # Names and numbers are from MDS-IF-LN-MIB (May 16, 2018).
 LINK_STATUS = {
@@ -85,9 +84,6 @@ CONN_REM_COLUMNS = (
     ("24", "downEvm", "mIfLnStatusConnRemStatsDwnEvm", "uint"),
     ("25", "downMod", "mIfLnStatusConnRemStatsDwnMod", "mod"),
 )
-
-# Every remote returns one value per column; leave room for a few extra.
-_MAX_BINDS = MAX_REMOTES * (len(CONN_REM_COLUMNS) + 2)
 
 _OPC_KIND = {
     "mac": "string",
@@ -306,12 +302,11 @@ def rows_from_binds(binds: list[tuple[str, object]]) -> list[dict]:
         try:
             row[key] = _decode(kind, value)
         except Exception:
-            # One odd value should not throw away the whole poll.
             log.debug("could not decode %s", oid, exc_info=True)
             row[key] = None
     rows = list(grouped.values())
     rows.sort(key=lambda item: (item["ifIndex"], item["mac"]))
-    return rows[:MAX_REMOTES]
+    return rows[:_MAX_REMOTES]
 
 
 def _blank_opc(kind: str):
@@ -375,8 +370,8 @@ class OrbitMaster:
         self._on_update = on_update
         self.on_save = None
         self._task: asyncio.Task | None = None
+        self._snmp = None
         self._lock = asyncio.Lock()
-        self._engine: SnmpEngine | None = None
 
     def _save(self) -> None:
         if self.on_save:
@@ -440,7 +435,6 @@ class OrbitMaster:
             except asyncio.CancelledError:
                 return
             except Exception:
-                # Keep polling; a failed OPC UA write or save must not stop the loop.
                 log.exception("radio poll cycle failed")
             try:
                 await asyncio.sleep(self.interval)
@@ -451,24 +445,30 @@ class OrbitMaster:
         async with self._lock:
             self.polling = True
             try:
-                if self._engine is None:
-                    self._engine = SnmpEngine()
-                binds = await _walk(self._engine, self.host, self.port, self.community)
+                binds = await _walk(self._engine(), self.host, self.port, self.community)
                 self.remotes = rows_from_binds(binds)
+                if self.error:
+                    log.info("master poll recovered")
                 self.error = None
                 self.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             except Exception as exc:
-                self.error = str(exc)[:300]
-                log.warning("master poll failed: %s", self.error)
+                error = str(exc)[:300]
+                if error != self.error:
+                    # Logged when the failure starts or changes, not every poll.
+                    log.warning("master poll failed: %s", error)
+                self.error = error
             finally:
                 self.polling = False
         await self._on_update(self.snapshot())
         return self.remotes
 
+    def _engine(self):
+        if self._snmp is None:
+            self._snmp = SnmpEngine()
+        return self._snmp
 
-async def _walk(engine: SnmpEngine, host: str, port: int, community: str) -> list[tuple[str, object]]:
-    # The engine is reused across polls. A new SnmpEngine per poll leaves its
-    # UDP socket and timer task running forever.
+
+async def _walk(engine, host: str, port: int, community: str) -> list[tuple[str, object]]:
     target = UdpTransportTarget((host, port), timeout=2, retries=1)
     auth = CommunityData(community, mpModel=1)
     context = ContextData()
@@ -494,6 +494,6 @@ async def _collect(stream) -> list[tuple[str, object]]:
         for var_bind in var_binds:
             name = ".".join(str(int(part)) for part in var_bind[0])
             found.append((name, var_bind[1]))
-            if len(found) > _MAX_BINDS:
+            if len(found) > _MAX_REMOTES * 30:
                 return found
     return found
