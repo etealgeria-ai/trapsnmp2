@@ -1,4 +1,4 @@
-# trapsnmp2 by ClaudeAI
+# trapsnmp2 made by GrokAI improved by ClaudeAI
 
 trapsnmp2 follows [trapsnmp](https://github.com/etealgeria-ai/trapsnmp) and adds a few fixes on top: the console is not access-logged, upstream outages are logged once, the upstream client closes when forwarding is switched off, only the newest 100 rejected client certificates are kept, EVENTS_COUNT wraps within UInt32, and Diagnose reconnects its loopback OPC UA session. The Python package is still `trapsnmp`, so it runs the same way.
 
