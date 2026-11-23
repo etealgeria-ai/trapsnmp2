@@ -689,10 +689,15 @@ class OpcuaBridge:
         if not self.ready or address not in self.node_ids:
             return None
         async with self._read_lock:
-            if self._reader is None:
+            try:
+                if self._reader is None:
+                    await self._connect_reader()
+                return await self._reader.get_node(self.node_ids[address]).read_value()
+            except Exception:
+                # The loopback session may have dropped during a long run; reconnect once.
+                await self._drop_reader()
                 await self._connect_reader()
-            node = self._reader.get_node(self.node_ids[address])
-            return await node.read_value()
+                return await self._reader.get_node(self.node_ids[address]).read_value()
 
     async def _write(self, key: str, value, variant: ua.VariantType) -> None:
         await self.nodes[key].write_value(value, variant)

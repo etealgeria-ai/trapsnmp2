@@ -736,6 +736,8 @@ td.oid {
   border-radius: var(--radius);
 }
 
+.login-card h2 { margin: 4px 0 16px; }
+
 .cert-row {
   display: flex;
   justify-content: space-between;
