@@ -4,6 +4,8 @@ trapsnmp2 follows [trapsnmp](https://github.com/etealgeria-ai/trapsnmp) and adds
 
 Comments in this README were made by Grok.
 
+The trapsnmp2 changes (the sync with trapsnmp, the long-run fixes, the Diagnose reconnect, and the soak test in `tools/soak_test.py`) were made by Claude, and those commits list Claude as author.
+
 Python gateway that receives SNMP traps and informs, then publishes each one as OPC UA variables and a `SnmpTrapEvent`.
 
 Supports SNMPv1, SNMPv2c, and SNMPv3 (`noAuthNoPriv`, `authNoPriv`, `authPriv`). SNMPv3 auth can be MD5, SHA, or SHA-256. Privacy can be DES or AES-128. A known user is localized to whatever engine ID the sender uses.
