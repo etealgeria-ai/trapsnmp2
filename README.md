@@ -32,7 +32,7 @@ The built-in SNMP agent answers Get, GetNext, GetBulk, and Set on UDP 1161, and 
 
 The Radios page polls a GE Orbit LN master (`mIfLnStatusConnRemTable`) and writes each connected radio into `Remote1` through `Remote255`. Radios past the 255th are not published. Every remote has the short tags (`remote_mac`, `remote_ip`, `rssi`, `down`, `if_index`) plus one tag per column of `mIfLnStatusConnRemEntry` in MDS-IF-LN-MIB. The master IP, community, port, and poll interval are set on the Config page.
 
-The Send page can simulate those columns for Remote1 through Remote255 every 10 seconds, one trap per remote, on one RSSI sine wave, with a random offset per remote.
+The Send page can simulate those columns for Remote1 through Remote255 every 10 seconds, one trap per remote, on one RSSI sine wave, with a random offset per remote. The sine is always stopped when the gateway starts; start it from the Send page.
 
 ## OPC UA security
 
@@ -42,7 +42,7 @@ A username token is offered as well. On the open endpoint the password is encryp
 
 ## Settings
 
-Communities, SNMPv3 users, the GE master, the agent, tag filters, upstream OPC UA, the sine switch, OPC UA users, and the last remote values are stored in `data/trapsnmp.ini` and loaded on the next start. The private key is not written into that file. Remote values are saved at most once a minute; configuration changes are saved immediately.
+Communities, SNMPv3 users, the GE master, the agent, tag filters, upstream OPC UA, OPC UA users, and the last remote values are stored in `data/trapsnmp.ini` and loaded on the next start. The private key is not written into that file. Remote values are saved at most once a minute; configuration changes are saved immediately.
 
 The data folder is `TRAPSNMP_DATA` if that variable is set, otherwise `/workspace/data` if it already exists (older installs), otherwise `data/` under the working directory. The path is logged at startup.
 

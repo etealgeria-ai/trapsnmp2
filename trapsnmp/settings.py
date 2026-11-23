@@ -158,7 +158,6 @@ def save(service) -> None:
             "community": dest.get("community", "public"),
             "version": dest.get("version", "2c"),
         }
-    parser["sine"] = {"enabled": "true" if service._sine_on else "false"}
     for name, password in service.opc.users.passwords.items():
         parser[f"opc.user.{name}"] = {"password": password}
     for index, row in enumerate(service.radios.remotes, start=1):
@@ -279,8 +278,8 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
         )
     if numbered:
         service.agent.destinations = destinations
-    if parser.has_section("sine"):
-        service._sine_on = _bool(parser["sine"].get("enabled"))
+    # A [sine] section from an older file is ignored: the RSSI sine always
+    # starts stopped and is started from the Send page.
     opc_users: dict[str, str] = {}
     for section in parser.sections():
         if section.startswith("opc.user."):

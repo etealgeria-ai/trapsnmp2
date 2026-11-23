@@ -169,8 +169,6 @@ class Service:
             await self.opc.write_rssi_wave(self.radios.remotes)
         if INI_PATH.exists():
             self._trace(f"Loaded settings from {INI_PATH}")
-        if self._sine_on:
-            self.set_sine(True)
         if self.agent.listening:
             self._trace(
                 f"SNMP agent on UDP {self.agent.port} at {self.agent.object_id()}"
