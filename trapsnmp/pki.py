@@ -33,6 +33,9 @@ APP_URI = "urn:trapsnmp:gateway"
 CERT_DAYS = 15 * 365
 RENEW_DAYS = 30
 _NAME = re.compile(r"^[0-9A-Fa-f]{40}\.der$")
+# Every untrusted client certificate is saved for the Publish page; keep only
+# the newest ones so the folder (re-read on each console refresh) stays small.
+MAX_REJECTED = 100
 
 PROFILES = (
     ua.SecurityPolicyType.NoSecurity,
@@ -178,6 +181,7 @@ class ClientCertValidator:
             self.rejected / f"{_thumb(certificate).replace(':', '')}.der",
             certificate.public_bytes(Encoding.DER),
         )
+        _keep_newest(self.rejected, MAX_REJECTED)
         raise ServiceError(ua.StatusCodes.BadCertificateUntrusted)
 
 
@@ -187,6 +191,18 @@ def _write_file(path: Path, data: bytes) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _keep_newest(folder: Path, keep: int) -> None:
+    files = _certs(folder)
+    if len(files) <= keep:
+        return
+    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in files[keep:]:
+        try:
+            path.unlink()
+        except OSError:
+            log.warning("could not remove old rejected certificate %s", path)
 
 
 def _certs(folder: Path) -> list[Path]:

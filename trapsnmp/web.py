@@ -464,7 +464,9 @@ async def serve(service: Service) -> None:
     app.router.add_post("/api/sine", handle_sine)
     app.router.add_post("/api/upstream", handle_upstream)
     app.router.add_static("/static", STATIC, show_index=False)
-    runner = web.AppRunner(app)
+    # No access log: an open console polls /api/state every second, which
+    # wrote about 86,000 log lines a day per browser tab.
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()

@@ -13,6 +13,7 @@ from asyncua import Client, Server, ua
 from trapsnmp.opc_users import USER_POLICY, PasswordUsers
 from trapsnmp.pki import PROFILES, Pki
 from trapsnmp.radios import OPC_TAGS, remote_opc_values
+from trapsnmp.tasks import spawn
 from trapsnmp.trap_tags import startup_nodes
 
 log = logging.getLogger("trapsnmp.opcua")
@@ -84,6 +85,7 @@ class OpcuaBridge:
         self._forward_lock = asyncio.Lock()
         self._forward_pause_until = 0.0
         self._forward_pause_reason = ""
+        self._forward_down = ""
         self._read_lock = asyncio.Lock()
         self._tag_store = None
         self._tags_parent = None
@@ -442,6 +444,18 @@ class OpcuaBridge:
         self._forward_url = ""
         self._forward_pause_until = 0.0
         self._forward_pause_reason = ""
+        self._forward_down = ""
+        if self._forwarder is not None:
+            # Close the old session now; when forwarding is off it would
+            # otherwise stay connected until the gateway restarts.
+            try:
+                spawn(self._close_forwarder(), name="upstream-close")
+            except RuntimeError:
+                pass
+
+    async def _close_forwarder(self) -> None:
+        async with self._forward_lock:
+            await self._drop_forwarder()
 
     def _forward_failed(self, reason: str) -> str:
         text = (reason or "Upstream did not answer").strip() or "Upstream did not answer"
@@ -485,8 +499,14 @@ class OpcuaBridge:
                     await self._drop_forwarder()
             except Exception:
                 log.exception("could not close the upstream client")
-            log.warning("upstream write failed: %s", reason)
+            if reason != self._forward_down:
+                # Logged when an outage starts or its reason changes, not every retry.
+                log.warning("upstream write failed: %s", reason)
+            self._forward_down = reason
             return self._forward_failed(reason)
+        if self._forward_down:
+            log.info("upstream forwarding recovered")
+            self._forward_down = ""
         self.upstream["forwarded"] += 1
         self.upstream["status"] = "Last write succeeded"
         try:

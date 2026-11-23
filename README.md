@@ -53,5 +53,7 @@ The RSSI sine stays stopped at startup. Start it from the Send page. Each step i
 - Each SNMPv3 sender engine ID gets its own copy of the user; at most 1,024 are kept, oldest dropped first.
 - The OPC UA certificate is valid for 15 years. Within 30 days of expiry the gateway warns once a day in the log and trace, and a restart renews it (clients then trust the new one).
 - An unreachable GE master is logged once when polling starts failing and once when it recovers.
-- Logs go to standard output. Run the gateway under systemd or another service manager that rotates logs.
+- Logs go to standard output. Run the gateway under systemd or another service manager that rotates logs. Console requests are not logged, and an upstream OPC UA outage is logged once when it starts and once when it recovers.
+- Only the newest 100 rejected OPC UA client certificates are kept in `data/pki/rejected`.
+- The last remote values are saved at most once a minute (about 130 KB with 255 remotes, roughly 200 MB of writes a day). That is fine for SSD or industrial flash; on a plain SD card, raise the 60-second interval in `Service.persist`.
 - The RSSI sine writes about 300 OPC UA nodes per trap (255 traps every 10 s). Leave it off on a production gateway.

@@ -31,6 +31,7 @@ EVENT_SLOTS = 10
 # Past this many extra addresses, traps still reach Latest, Recent, the event,
 # and EVENTS_001..010, but get no new TRAP_ tags.
 MAX_TRAP_TAGS = 2000
+_UINT32 = 2**32
 FIELD_SLOTS = 20
 TABLE_ROWS = 20
 
@@ -184,7 +185,7 @@ class TrapTags:
     def note_write(self, address: str, value) -> None:
         if address == "EVENTS_COUNT":
             try:
-                self.count = max(0, int(value))
+                self.count = max(0, int(value)) % _UINT32
             except (TypeError, ValueError):
                 return
             return
@@ -198,7 +199,8 @@ class TrapTags:
         else:
             generic, specific, enterprise = v2_identity(oid)
         fields = virtual_fields(record, enterprise, generic, specific)
-        self.count += 1
+        # EVENTS_COUNT is a UInt32; past 4,294,967,295 every write would fail.
+        self.count = (self.count + 1) % _UINT32
         self.queue.insert(0, fields)
         del self.queue[self.event_slots :]
         updates: list[dict] = [
