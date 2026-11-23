@@ -1,4 +1,6 @@
-# trapsnmp
+# trapsnmp2
+
+A debugged copy of [trapsnmp](https://github.com/etealgeria-ai/trapsnmp). The Python package is still called `trapsnmp`, so it runs the same way. See [Fixes in trapsnmp2](#fixes-in-trapsnmp2) below.
 
 Comments in this README were made by Grok.
 
@@ -40,4 +42,23 @@ A username token is offered as well. On the open endpoint the password is encryp
 
 ## Settings
 
-Communities, SNMPv3 users, the GE master, the agent, tag filters, upstream OPC UA, the sine switch, OPC UA users, and the last remote values are stored in `data/trapsnmp.ini` and loaded on the next start. The private key is not written into that file.
+Communities, SNMPv3 users, the GE master, the agent, tag filters, upstream OPC UA, the sine switch, OPC UA users, and the last remote values are stored in `data/trapsnmp.ini` and loaded on the next start. The private key is not written into that file. Remote values are saved at most once a minute; configuration changes are saved immediately.
+
+The data folder is `TRAPSNMP_DATA` if that variable is set, otherwise `/workspace/data` if it already exists (older installs), otherwise `data/` under the working directory. The path is logged at startup.
+
+## Fixes in trapsnmp2
+
+- Settings and certificates no longer require `/workspace/data`; the gateway used to crash at start on machines without it. See the data folder note above.
+- The GE Orbit poller reuses one SNMP engine. A new engine per poll left a UDP socket and a timer task running every time.
+- The poller keeps up to 999 remotes, matching `Remote1`–`Remote999` (it stopped at 256).
+- Remote values are saved once a minute instead of every 2 seconds, and the settings file is written atomically.
+- The radio poller and the RSSI sine keep running after a failed step instead of stopping silently.
+- Upstream OPC UA forwarding uses one connection at a time, times out after 2 s, and pauses 10 s after a failure, so a dead upstream no longer stalls every trap.
+- Console test traps: SNMPv1 enterprise-specific traps are no longer reported as "not accepted", and a look-alike trap cannot be mistaken for the one just sent.
+- Removing an agent community now stops it from working right away.
+- Console POST requests must be `application/json`, which blocks cross-site form posts.
+- OPC UA passwords with non-ASCII characters work; the private key file is `0600`; an expired application certificate is replaced at start.
+- `Recent` has its own folder in the OPC UA browser instead of showing under Tags.
+- The console makes one `/api/state` request at a time, and the response no longer carries every remote twice.
+
+Not changed yet: the console still has no login and listens on all interfaces, and the RSSI sine still sends 999 loopback traps every 2 s.

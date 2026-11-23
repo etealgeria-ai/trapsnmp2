@@ -26,8 +26,13 @@ class PasswordUsers:
             return User(role=UserRole.User)
         expected = self.passwords.get(username)
         offered = password or ""
+        if isinstance(offered, (bytes, bytearray)):
+            offered = bytes(offered).decode("utf-8", "replace")
         try:
-            matched = expected is not None and secrets.compare_digest(expected, offered)
+            # compare_digest only takes ASCII str, so compare UTF-8 bytes.
+            matched = expected is not None and secrets.compare_digest(
+                expected.encode("utf-8"), str(offered).encode("utf-8")
+            )
         except Exception:
             matched = False
         if not matched:

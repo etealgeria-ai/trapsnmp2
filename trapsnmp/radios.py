@@ -28,7 +28,8 @@ log = logging.getLogger("trapsnmp.radios")
 
 ENTRY = "1.3.6.1.4.1.4130.10.2.5.1.2.2.1"
 _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")
-_MAX_REMOTES = 256
+# One OPC UA folder per remote, Remote1 through Remote999.
+MAX_REMOTES = 999
 
 # Names and numbers are from MDS-IF-LN-MIB (May 16, 2018).
 LINK_STATUS = {
@@ -84,6 +85,9 @@ CONN_REM_COLUMNS = (
     ("24", "downEvm", "mIfLnStatusConnRemStatsDwnEvm", "uint"),
     ("25", "downMod", "mIfLnStatusConnRemStatsDwnMod", "mod"),
 )
+
+# Every remote returns one value per column; leave room for a few extra.
+_MAX_BINDS = MAX_REMOTES * (len(CONN_REM_COLUMNS) + 2)
 
 _OPC_KIND = {
     "mac": "string",
@@ -171,8 +175,22 @@ def _as_int(value) -> int | None:
     return None
 
 
+def _octets(value) -> bytes:
+    """Raw bytes of an OCTET STRING. Never calls bytes() on an integer,
+    which would build a zero-filled buffer of that length."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    as_octets = getattr(value, "asOctets", None)
+    if callable(as_octets):
+        try:
+            return bytes(as_octets())
+        except Exception:
+            return b""
+    return b""
+
+
 def _as_text(value) -> str:
-    raw = bytes(value) if not isinstance(value, str) else b""
+    raw = _octets(value)
     if raw and all(32 <= byte < 127 for byte in raw):
         return raw.decode("ascii").strip()
     text = str(value).strip().strip('"')
@@ -191,10 +209,7 @@ def _as_mac(value) -> str:
         if re.fullmatch(r"[0-9a-f]{12}", compact):
             return ":".join(compact[index : index + 2] for index in range(0, 12, 2)).upper()
         return ""
-    try:
-        raw = bytes(value)
-    except (TypeError, ValueError):
-        return ""
+    raw = _octets(value)
     if len(raw) == 6:
         return ":".join(f"{byte:02X}" for byte in raw)
     return ""
@@ -204,10 +219,7 @@ def _as_ip(value) -> str:
     text = str(value).strip()
     if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", text):
         return text
-    try:
-        raw = bytes(value) if not isinstance(value, str) else b""
-    except (TypeError, ValueError):
-        raw = b""
+    raw = _octets(value)
     if len(raw) == 4:
         return ".".join(str(byte) for byte in raw)
     if len(raw) == 16:
@@ -291,10 +303,15 @@ def rows_from_binds(binds: list[tuple[str, object]]) -> list[dict]:
         if spec is None:
             continue
         key, kind = spec
-        row[key] = _decode(kind, value)
+        try:
+            row[key] = _decode(kind, value)
+        except Exception:
+            # One odd value should not throw away the whole poll.
+            log.debug("could not decode %s", oid, exc_info=True)
+            row[key] = None
     rows = list(grouped.values())
     rows.sort(key=lambda item: (item["ifIndex"], item["mac"]))
-    return rows[:_MAX_REMOTES]
+    return rows[:MAX_REMOTES]
 
 
 def _blank_opc(kind: str):
@@ -359,6 +376,7 @@ class OrbitMaster:
         self.on_save = None
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._engine: SnmpEngine | None = None
 
     def _save(self) -> None:
         if self.on_save:
@@ -417,7 +435,13 @@ class OrbitMaster:
 
     async def _loop(self) -> None:
         while self.enabled:
-            await self.poll()
+            try:
+                await self.poll()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # Keep polling; a failed OPC UA write or save must not stop the loop.
+                log.exception("radio poll cycle failed")
             try:
                 await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
@@ -427,7 +451,9 @@ class OrbitMaster:
         async with self._lock:
             self.polling = True
             try:
-                binds = await _walk(self.host, self.port, self.community)
+                if self._engine is None:
+                    self._engine = SnmpEngine()
+                binds = await _walk(self._engine, self.host, self.port, self.community)
                 self.remotes = rows_from_binds(binds)
                 self.error = None
                 self.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -440,8 +466,9 @@ class OrbitMaster:
         return self.remotes
 
 
-async def _walk(host: str, port: int, community: str) -> list[tuple[str, object]]:
-    engine = SnmpEngine()
+async def _walk(engine: SnmpEngine, host: str, port: int, community: str) -> list[tuple[str, object]]:
+    # The engine is reused across polls. A new SnmpEngine per poll leaves its
+    # UDP socket and timer task running forever.
     target = UdpTransportTarget((host, port), timeout=2, retries=1)
     auth = CommunityData(community, mpModel=1)
     context = ContextData()
@@ -467,6 +494,6 @@ async def _collect(stream) -> list[tuple[str, object]]:
         for var_bind in var_binds:
             name = ".".join(str(int(part)) for part in var_bind[0])
             found.append((name, var_bind[1]))
-            if len(found) > _MAX_REMOTES * 30:
+            if len(found) > _MAX_BINDS:
                 return found
     return found

@@ -21,6 +21,7 @@ from trapsnmp.opcua_out import NS_URI, REMOTE_TAG_COUNT, OpcuaBridge
 from trapsnmp.settings import INI_PATH, load as load_settings
 from trapsnmp.settings import save as save_settings
 from trapsnmp.snmp_in import SnmpTrapIn
+from trapsnmp.tasks import spawn
 
 log = logging.getLogger("trapsnmp")
 
@@ -68,6 +69,26 @@ _SINE_INDEX = "1.0.26.139.1.2.3"
 _SINE_MAC = "00:1A:8B:01:02:03"
 _SINE_IP = "10.1.2.3"
 _REM = "1.3.6.1.4.1.4130.10.2.5.1.2.2.1"
+# Remote values change every poll or sine step; save them at most this often
+# instead of rewriting the whole settings file each time.
+_SAVE_REMOTES_EVERY = 60.0
+_INJECT_TIMEOUT = 5.0
+_V2_GENERIC = tuple(f"1.3.6.1.6.3.1.1.5.{number}" for number in range(1, 7))
+_WIRE_VERSION = {"1": "v1", "2c": "v2c", "3": "v3"}
+
+
+def _received_trap_oid(trap_oid: str, version: str) -> str:
+    """snmpTrapOID the receiver reports after a v1 round trip (RFC 3584).
+
+    A v1 trap carries enterprise, generic, and specific. For an
+    enterprise-specific trap the receiver rebuilds enterprise.0.specific,
+    so 1.3.6.1.4.1.99999.1.1 comes back as 1.3.6.1.4.1.99999.1.0.1.
+    """
+    if version != "1" or trap_oid in _V2_GENERIC:
+        return trap_oid
+    parts = trap_oid.split(".")
+    enterprise = parts[:-2] if len(parts) > 2 and parts[-2] == "0" else parts[:-1]
+    return ".".join([*enterprise, "0", parts[-1]])
 
 
 class Service:
@@ -85,7 +106,8 @@ class Service:
         self._seq = 0
         self._inject_lock = asyncio.Lock()
         self._pending: asyncio.Future | None = None
-        self._expect = ""
+        self._expect: tuple[str, str, frozenset[str]] | None = None
+        self._save_handle: asyncio.TimerHandle | None = None
         self._sine_on = False
         self._sine_task: asyncio.Task | None = None
         self._sine_t0 = 0.0
@@ -99,7 +121,25 @@ class Service:
         self.radios.on_save = self.persist
 
     def persist(self) -> None:
-        save_settings(self)
+        if self._save_handle is not None:
+            self._save_handle.cancel()
+            self._save_handle = None
+        try:
+            save_settings(self)
+        except OSError as exc:
+            log.exception("could not save settings")
+            self._trace(f"Could not save settings to {INI_PATH}: {exc}")
+
+    def persist_soon(self) -> None:
+        """Save remote values later, at most once per _SAVE_REMOTES_EVERY."""
+        if self._save_handle is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.persist()
+            return
+        self._save_handle = loop.call_later(_SAVE_REMOTES_EVERY, self.persist)
 
     async def start(self) -> None:
         if self._started:
@@ -147,10 +187,11 @@ class Service:
         for slot in range(1, REMOTE_TAG_COUNT + 1):
             row = remotes[slot - 1] if slot <= len(remotes) else None
             node = f"ns={index};s=Remote{slot}" if index else f"Remote{slot}"
-            if row is not None:
-                row["rssiNode"] = f"{node}.rssi"
             slots.append({"tag": f"Remote{slot}", "node": node, **slot_fields(row)})
         snap["slots"] = slots
+        # The console reads the slots. Sending the raw rows too doubled the
+        # size of every /api/state response.
+        snap.pop("remotes", None)
         return snap
 
     def sine_view(self) -> dict:
@@ -183,7 +224,15 @@ class Service:
     async def _sine_loop(self) -> None:
         try:
             while self._sine_on:
-                await self._sine_once()
+                try:
+                    await self._sine_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Keep the wave running; without this one failed write
+                    # stopped it while the console still showed it as on.
+                    log.exception("RSSI sine step failed")
+                    self._trace(f"RSSI sine step failed: {exc}")
                 await asyncio.sleep(_SINE_EVERY)
         except asyncio.CancelledError:
             return
@@ -251,7 +300,7 @@ class Service:
         self.radios.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if self.opc.ready:
             await self.opc.write_rssi_wave(rows)
-        self.persist()
+        self.persist_soon()
 
     async def _on_radios(self, snap: dict) -> None:
         note = snap.get("error") or f"{snap['host']}: {snap['count']} remote" + ("" if snap["count"] == 1 else "s")
@@ -260,7 +309,7 @@ class Service:
             self._trace("Radio poll failed: " + snap["error"] if snap.get("error") else "Radio poll " + note)
         if self.opc.ready:
             await self.opc.publish_radios(snap)
-        self.persist()
+        self.persist_soon()
 
     async def snapshot(self) -> dict:
         readback = await self.opc.readback()
@@ -444,6 +493,9 @@ class Service:
             raise ValueError("Community must be 1–64 characters.")
         if any(ch in community for ch in "\r\n\x00"):
             raise ValueError("Community contains a control character.")
+        if "," in community:
+            # Communities are saved as a comma-separated list.
+            raise ValueError("Community cannot contain a comma.")
         self.snmp.allow(community)
         self._trace(f"Community '{community}' is now accepted")
 
@@ -472,7 +524,13 @@ class Service:
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
             self._pending = fut
-            self._expect = trap_oid
+            # Match on what the receiver will report, not only the trap OID:
+            # a sine trap or a real device can share the same trap OID.
+            self._expect = (
+                _received_trap_oid(trap_oid, version),
+                _WIRE_VERSION.get(version, version),
+                frozenset(oid for oid, _kind, _value in varbinds),
+            )
             try:
                 await self.snmp.send(
                     community=community,
@@ -481,7 +539,7 @@ class Service:
                     varbinds=varbinds,
                     user=user,
                 )
-                return await asyncio.wait_for(fut, 3.0)
+                return await asyncio.wait_for(fut, _INJECT_TIMEOUT)
             except asyncio.TimeoutError as exc:
                 raise RuntimeError(
                     "The trap was sent, but the receiver did not accept it. "
@@ -490,7 +548,7 @@ class Service:
             finally:
                 if self._pending is fut:
                     self._pending = None
-                    self._expect = ""
+                    self._expect = None
 
     async def _ingest(self, snap: dict, rows: list[tuple[str, str, str]]) -> None:
         trap_oid = ""
@@ -568,16 +626,21 @@ class Service:
         )
         try:
             self.agent.observe(public)
-            asyncio.create_task(self.agent.maybe_notify(public))
+            spawn(self.agent.maybe_notify(public), name="agent-notify")
         except Exception:
             log.exception("agent update failed")
         pending = self._pending
-        if (
-            pending is not None
-            and not pending.done()
-            and public["trapOid"] == self._expect
-        ):
+        if pending is not None and not pending.done() and self._is_expected(public):
             pending.set_result(public)
+
+    def _is_expected(self, record: dict) -> bool:
+        if self._expect is None:
+            return False
+        trap_oid, version, oids = self._expect
+        if record["trapOid"] != trap_oid or record["version"] != version:
+            return False
+        received = {item["oid"] for item in record["varbinds"]}
+        return oids <= received
 
     def _trace(self, line: str) -> None:
         stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")

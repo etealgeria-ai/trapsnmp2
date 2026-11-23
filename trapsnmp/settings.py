@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import configparser
 import json
-from pathlib import Path
+import logging
+import os
 
-INI_PATH = Path("/workspace/data/trapsnmp.ini")
-_JSON_PATH = Path("/workspace/data/ge-master.json")
+from trapsnmp.agent import COMPARISONS
+from trapsnmp.paths import DATA_DIR
+
+log = logging.getLogger("trapsnmp.settings")
+
+INI_PATH = DATA_DIR / "trapsnmp.ini"
+_JSON_PATH = DATA_DIR / "ge-master.json"
 
 _REMOTE_FIELDS = (
     "ifIndex",
@@ -92,7 +98,11 @@ def load(service) -> None:
     finally:
         service._loading = False
     if not INI_PATH.exists():
-        save(service)
+        try:
+            save(service)
+        except OSError:
+            # Keep running with defaults; the console shows the next save error.
+            log.exception("Could not create %s", INI_PATH)
 
 
 def save(service) -> None:
@@ -163,9 +173,15 @@ def save(service) -> None:
         if section:
             parser[f"remote.{index}"] = section
     INI_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with INI_PATH.open("w", encoding="utf-8") as handle:
+    # Write a temporary file and swap it in, so a crash or power loss mid-write
+    # never leaves a truncated settings file behind.
+    temp = INI_PATH.with_name(INI_PATH.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
         handle.write("; trapsnmp settings. Loaded automatically on the next start.\n")
         parser.write(handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, INI_PATH)
 
 
 def _migrate_master(service) -> None:
@@ -220,8 +236,10 @@ def _apply(service, parser: configparser.ConfigParser) -> None:
         agent.accept_all = _bool(item.get("accept_all"), True)
         agent._store["enabled"] = agent.enabled
         comparison = item.get("comparison", agent.comparison)
-        if comparison:
+        if comparison in COMPARISONS:
             agent.comparison = comparison
+        elif comparison:
+            log.warning("Ignoring unknown agent comparison %r in %s", comparison, INI_PATH)
         agent.threshold = _int(item.get("threshold"), agent.threshold)
         agent.description = item.get("description", agent.description)
         agent.contact = item.get("contact", "")

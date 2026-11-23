@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from trapsnmp.paths import DATA_DIR
 from trapsnmp.service import Service
+from trapsnmp.tasks import spawn
 from trapsnmp.web import serve
 
 
@@ -15,15 +17,15 @@ async def _amain() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     service = Service()
-    starter = asyncio.create_task(service.start())
+    logging.getLogger("trapsnmp").info("Settings and certificates in %s", DATA_DIR)
 
-    async def _watch() -> None:
+    async def _start() -> None:
         try:
-            await starter
+            await service.start()
         except Exception:
             logging.getLogger("trapsnmp").exception("gateway start failed")
 
-    asyncio.create_task(_watch())
+    spawn(_start(), name="gateway-start")
     await serve(service)
 
 

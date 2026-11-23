@@ -35,6 +35,8 @@ from pysnmp.proto.mpmod.rfc3412 import SNMPv3Message
 from pysnmp.proto.secmod.rfc3414.service import UsmSecurityParameters
 from pysnmp.smi.error import NoSuchInstanceError
 
+from trapsnmp.tasks import spawn
+
 log = logging.getLogger("trapsnmp.snmp")
 
 OnTrap = Callable[[dict, list[tuple[str, str, str]]], Awaitable[None]]
@@ -311,7 +313,7 @@ class SnmpTrapIn:
             "securityLevel": sink.get("securityLevel", ""),
         }
         try:
-            asyncio.get_running_loop().create_task(self._dispatch(snap, rows))
+            spawn(self._dispatch(snap, rows), name="trap-dispatch")
         except RuntimeError:
             log.exception("trap dropped; no running loop")
 

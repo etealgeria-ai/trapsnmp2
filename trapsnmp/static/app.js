@@ -25,7 +25,20 @@ function ago(iso) {
   return `${iso.slice(11, 19)} UTC`;
 }
 
-async function tick() {
+let ticking = null;
+
+// One /api/state request at a time. When the gateway is busy a reply can take
+// longer than the 1 s interval, and overlapping requests used to pile up.
+function tick() {
+  if (!ticking) {
+    ticking = refreshState().finally(() => {
+      ticking = null;
+    });
+  }
+  return ticking;
+}
+
+async function refreshState() {
   try {
     const response = await fetch("/api/state");
     if (!response.ok) throw new Error("status");
@@ -644,6 +657,7 @@ function opcTree() {
   host.innerHTML = [
     button("trapsnmp", "trapsnmp", ""),
     button("Latest", "Latest", "child"),
+    button("Recent", "Recent", "child"),
     button("Gateway", "Gateway", "child"),
     button("Upstream", "Upstream", "child"),
     button("Radios", "Radios", "child"),

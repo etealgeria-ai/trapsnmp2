@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import socket
 from datetime import datetime, timezone
@@ -22,9 +23,11 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+from trapsnmp.paths import DATA_DIR
+
 log = logging.getLogger("trapsnmp.pki")
 
-PKI_ROOT = Path("/workspace/data/pki")
+PKI_ROOT = DATA_DIR / "pki"
 APP_URI = "urn:trapsnmp:gateway"
 _NAME = re.compile(r"^[0-9A-Fa-f]{40}\.der$")
 
@@ -57,7 +60,19 @@ class Pki:
         if not store.key_file.is_file() or not store.cert_file.is_file():
             store._create()
             log.info("Created OPC UA certificate %s", store.cert_file)
+        elif store._expired():
+            # Clients reject an expired server certificate, so make a new one.
+            # Clients that trusted the old one must trust the new thumbprint.
+            store._create()
+            log.warning("OPC UA certificate had expired; created a new one at %s", store.cert_file)
         return store
+
+    def _expired(self) -> bool:
+        try:
+            return self.certificate().not_valid_after_utc <= datetime.now(timezone.utc)
+        except Exception:
+            log.warning("Could not read %s; creating a new certificate", self.cert_file, exc_info=True)
+            return True
 
     def _create(self) -> None:
         host = socket.gethostname() or "localhost"
@@ -79,7 +94,14 @@ class Pki:
             [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
             days=365,
         )
-        self.key_file.write_bytes(dump_private_key_as_pem(key))
+        # Only the gateway's own account may read the private key.
+        descriptor = os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(dump_private_key_as_pem(key))
+        try:
+            os.chmod(self.key_file, 0o600)
+        except OSError:
+            pass
         self.cert_file.write_bytes(certificate.public_bytes(Encoding.DER))
 
     def certificate(self) -> x509.Certificate:

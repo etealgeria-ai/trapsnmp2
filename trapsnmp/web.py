@@ -50,6 +50,16 @@ def _json_error(message: str, status: int = 400) -> web.Response:
     return web.json_response({"ok": False, "error": message}, status=status)
 
 
+@web.middleware
+async def _require_json(request: web.Request, handler):
+    # A page on another site can POST text/plain without a CORS preflight,
+    # and request.json() would still parse it. Requiring application/json
+    # forces a preflight, which this server never approves.
+    if request.method == "POST" and request.content_type != "application/json":
+        return _json_error("Send JSON with Content-Type: application/json.", 415)
+    return await handler(request)
+
+
 async def handle_index(_request: web.Request) -> web.Response:
     return web.Response(
         text=PAGE,
@@ -305,7 +315,7 @@ def _optional_str(value) -> str | None:
 
 
 async def serve(service: Service) -> None:
-    app = web.Application(client_max_size=1024 * 256)
+    app = web.Application(client_max_size=1024 * 256, middlewares=[_require_json])
     app["service"] = service
     app.router.add_get("/", handle_index)
     app.router.add_get("/favicon.svg", handle_favicon)
